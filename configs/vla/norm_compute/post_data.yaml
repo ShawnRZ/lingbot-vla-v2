@@ -1,7 +1,7 @@
 data:
   datasets_type: vla
   data_name: multi
-  robot_name: 
+  robot_name: galaxea_r1lite
   train_path: 
   robot_config_root: configs/robot_configs
   norm_path: 

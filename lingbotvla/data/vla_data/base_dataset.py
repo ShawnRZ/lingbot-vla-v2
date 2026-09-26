@@ -205,11 +205,16 @@ class VLADataset(Dataset):
         self.dataset_meta = LeRobotDatasetMetadata(**metadata_kwargs)
         merged_delta = {**self.get_delta_timestamps(), **self.get_video_delta_timestamps()}
 
+        dataset_kwargs = _filter_supported_kwargs(
+            BaseLeRobotDataset.__init__,
+            {"root": lerobot_root},
+        )
         self.dataset = LeRobotDataset(
-            repo_id=repo_id,
+            repo_id=lerobot_repo_id,
             image_transforms=Resize(image_size),
             delta_timestamps=merged_delta,
-            load_image=load_image
+            load_image=load_image,
+            **dataset_kwargs,
         )
 
         self.return_item = return_item
