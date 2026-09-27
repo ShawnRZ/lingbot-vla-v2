@@ -269,14 +269,26 @@ def build_muon_optimizer(
     weight_decay: float = 0.0,
     adamw_betas: Tuple[float, float] = (0.9, 0.95),
     adamw_eps: float = 1e-8,
+    lora_lr: Optional[float] = None,
 ) -> "torch.optim.Optimizer":
-    """Build DistributedMuon for matrix-like weights plus AdamW fallback groups."""
+    """Build DistributedMuon for matrix-like weights plus AdamW fallback groups.
+
+    When `lora_lr` is set, LoRA A/B matrices are routed to AdamW at `lora_lr`.
+    """
+    extra_adamw_patterns = list(getattr(args_train, "muon_exclude_name_patterns", None) or [])
+    if lora_lr is not None:
+        extra_adamw_patterns.append(".lora_")
     muon_params, adamw_params, muon_names, adamw_names = split_muon_adamw_params(
         model,
         no_decay_modules=None,
         no_decay_params=None,
-        extra_adamw_name_patterns=getattr(args_train, "muon_exclude_name_patterns", None) or None,
+        extra_adamw_name_patterns=extra_adamw_patterns or None,
     )
+    lora_params: List[torch.Tensor] = []
+    if lora_lr is not None:
+        kept = [(p, n) for p, n in zip(adamw_params, adamw_names) if ".lora_" not in n]
+        lora_params = [p for p, n in zip(adamw_params, adamw_names) if ".lora_" in n]
+        adamw_params, adamw_names = [p for p, _ in kept], [n for _, n in kept]
 
     use_expert_lr = bool(getattr(args_train, "use_moe", False)) and bool(
         getattr(args_train, "use_moe_expert_lr", False)
@@ -296,6 +308,8 @@ def build_muon_optimizer(
     adamw_groups = _split_param_groups_by_scaled_lr(
         list(zip(adamw_params, adamw_names)), lr, layer_to_scale, layer_re
     )
+    if lora_params:
+        adamw_groups.append({"params": lora_params, "lr": lora_lr})
 
     if not muon_groups:
         raise RuntimeError(

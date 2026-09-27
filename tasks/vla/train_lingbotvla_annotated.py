@@ -1,3 +1,7 @@
+# LingBot-VLA 训练脚本（train_lingbotvla.py 的注释版副本，只添加了注释，代码与原文件一致）
+# 启动方式：bash train.sh tasks/vla/train_lingbotvla.py configs/vla/robotwin/robotwin.yaml
+# 整体流程：解析参数 → 初始化分布式 → 构建模型 → 构建数据 → FSDP 并行化
+#         → 优化器 / 学习率调度 → 恢复 checkpoint → 训练循环 → 保存 checkpoint
 import json
 import os
 import re
@@ -35,7 +39,6 @@ from lingbotvla.utils import helper
 from lingbotvla.utils.async_hf_checkpoint import AsyncHFCheckpointSaver
 from lingbotvla.utils.arguments import EvalArguments, DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from lingbotvla.utils.dist_utils import all_reduce
-from lingbotvla.utils.lora_utils import LORA_PARAM_PATTERN, apply_lora_and_freeze, summarize_trainable_params
 from lingbotvla.models.config_registry import get_config_registry
 
 from lingbotvla.models.vla.vision_models.module_utils import (
@@ -47,6 +50,7 @@ from lingbotvla.models.vla.vision_models.module_utils import (
 )
 from lingbotvla.models.vla.lingbot_vla.moe_load_balance import build_moe_load_balance_hook
 import gc
+# 调高 GC 阈值，减少 Python 垃圾回收频率，降低训练过程中的卡顿
 gc.set_threshold(50000, 50, 50)
 
 logger = helper.create_logger(__name__)
@@ -55,6 +59,8 @@ logger = helper.create_logger(__name__)
 # except Exception as e:
 #     logger.info_rank0(f"Failed to import aistudio_tracking: {repr(e)}.")
 
+# 把可训练参数分成 ViT（名字含 visual）和其他两组，分别使用 vit_lr / default_lr
+# 注意：main() 中目前没有调用这个函数
 def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float):
     vit_params, other_params = [], []
     for name, param in model.named_parameters():
@@ -67,6 +73,7 @@ def get_param_groups(model: "torch.nn.Module", default_lr: float, vit_lr: float)
     return [{"params": vit_params, "lr": vit_lr}, {"params": other_params, "lr": default_lr}]
 
 
+# MoE 专用参数分组：只放大路由专家（.mlp.experts.*）的学习率，详见下方 docstring
 def get_moe_param_groups(model: "torch.nn.Module", args_train) -> Optional[List[Dict]]:
     """
     Build optimizer param groups with token-MoE expert LR scaling.
@@ -99,6 +106,7 @@ def get_moe_param_groups(model: "torch.nn.Module", args_train) -> Optional[List[
     # Gate / shared_expert / shared_expert_gate keep base_lr.
     layer_expert_re = re.compile(r'\.layers\.(\d+)\.mlp\.experts\.')
 
+    # 按学习率归类参数：lr -> 参数列表
     lr_to_params: Dict[float, List] = {base_lr: []}
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -116,8 +124,10 @@ def get_moe_param_groups(model: "torch.nn.Module", args_train) -> Optional[List[
 
     return [{"params": params, "lr": lr} for lr, params in lr_to_params.items() if params]
 
+# 在通用 TrainingArguments 基础上扩展的训练参数，对应 yaml 中的 train: 段
 @dataclass
 class MyTrainingArguments(TrainingArguments):
+    # ---- 冻结 / 部分训练 ----
     freeze_vit: bool = field(
         default=False,
         metadata={"help": "Whether or not to freeze the vit parameters."},
@@ -138,6 +148,7 @@ class MyTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Train state proj only or not."},
     )
+    # ---- 语言 token 长度、动作/状态维度、动作块长度 ----
     tokenizer_max_length: int = field(
         default=48,
         metadata={"help": "Maximum length of the tokenizer."},
@@ -158,6 +169,7 @@ class MyTrainingArguments(TrainingArguments):
         default=50,
         metadata={"help": "Chunk size of action."},
     )
+    # ---- 注意力与损失 ----
     vlm_causal: bool = field(
         default=False,
         metadata={"help": "Whether to use causal atten for img anb lang tokens in vlm."},
@@ -178,6 +190,7 @@ class MyTrainingArguments(TrainingArguments):
         default=72,
         metadata={"help": ""},
     )
+    # ---- 分段梯度裁剪：超过 stable_train_steps 后改用 decayed_max_grad_norm ----
     decayed_max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Maximum norm for the decayed gradients."},
@@ -186,10 +199,12 @@ class MyTrainingArguments(TrainingArguments):
         default=100000,
         metadata={"help": "Training steps for stable training, after this step, the decayed_max_grad_norm will be applied."},
     )
+    # ---- 断点续训 ----
     resume_dataloader_state: bool = field(
         default=True,
         metadata={"help": "Whether to resume dataloader."},
     )
+    # ---- Token 级 MoE 结构 ----
     use_moe: bool = field(
         default=False,
         metadata={"help": "Whether to use MoE."},
@@ -214,6 +229,7 @@ class MyTrainingArguments(TrainingArguments):
         default=256,
         metadata={"help": "Intermediate size for token-level shared expert FFN."},
     )
+    # ---- MoE 负载均衡：loss-free bias 更新 + 可选辅助损失 ----
     bias_update_speed: float = field(
         default=0.001,
         metadata={"help": "Bias update speed for loss-free MoE load balancing."},
@@ -242,6 +258,7 @@ class MyTrainingArguments(TrainingArguments):
         default=50,
         metadata={"help": "Step interval for writing per-layer MoE monitor scalars (moe_maxvio/minvio/minload/entropy/topksigmoid) and expert-selection histograms to TensorBoard. moe_summary/* is always written every step. Set small (e.g. 1/10) for close debugging."},
     )
+    # ---- Router 设计 ----
     router_activation: str = field(
         default="softmax",
         metadata={"help": "Router activation function: 'softmax' or 'sigmoid'. Default 'softmax' for backward compat."},
@@ -263,6 +280,7 @@ class MyTrainingArguments(TrainingArguments):
         default=2752,
         metadata={"help": "FFN intermediate size for action expert."},
     )
+    # ---- 精度与性能 ----
     action_fp32: bool = field(
         default=False,
         metadata={"help": "Whether to use fp32 action and state."},
@@ -271,10 +289,12 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to precompute and cache grid_thw-derived tensors (rotary_pos_emb, window_index, etc.) for fixed-resolution training."},
     )
+    # 路由专家学习率放大开关，对应 get_moe_param_groups
     use_moe_expert_lr: bool = field(
         default=False,
         metadata={"help": "Whether to apply scaled LR to MoE routed experts."},
     )
+    # ---- FSDP2 包装策略 ----
     split_fused_experts_from_decoder_fsdp: bool = field(
         default=False,
         metadata={"help": "Whether to exclude Qwen2FusedExperts params from Qwen2DecoderLayer FSDP2 units without wrapping the experts in FSDP2."},
@@ -283,39 +303,11 @@ class MyTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Whether to apply FSDP2 for VLM."},
     )
-    use_lora: bool = field(
-        default=False,
-        metadata={"help": "Freeze the model, inject LoRA into `lora_target_modules` and unfreeze `lora_trainable_patterns`."},
-    )
-    lora_rank: int = field(
-        default=32,
-        metadata={"help": "LoRA rank."},
-    )
-    lora_alpha: float = field(
-        default=32.0,
-        metadata={"help": "LoRA alpha; the LoRA branch is scaled by alpha / rank."},
-    )
-    lora_dropout: float = field(
-        default=0.0,
-        metadata={"help": "Dropout on the LoRA branch input."},
-    )
-    lora_lr: Optional[float] = field(
-        default=None,
-        metadata={"help": "Learning rate for LoRA params (always optimized by AdamW). Defaults to `lr`."},
-    )
-    lora_target_modules: Optional[List[str]] = field(
-        default_factory=lambda: [
-            r"qwenvl\.model\.language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)$",
-        ],
-        metadata={"help": "Regexes (re.search) over module FQNs; matching nn.Linear modules get LoRA."},
-    )
-    lora_trainable_patterns: Optional[List[str]] = field(
-        default_factory=list,
-        metadata={"help": "Regexes (re.search) over param FQNs that stay fully trainable when `use_lora` is on."},
-    )
 
+# 扩展的数据参数，对应 yaml 中的 data: 段
 @dataclass
 class MyDataArguments(DataArguments):
+    # ---- 数据源与机器人配置（关节顺序、相机顺序）----
     source_name: str = field(
         default=None,
         metadata={"help": "Source name of dataset."},
@@ -332,6 +324,7 @@ class MyDataArguments(DataArguments):
         default=None,
         metadata={"help": "The order of used images"},
     )
+    # ---- 归一化 ----
     norm_type: Optional[List[str]] = field(default=None, metadata={"help": "Normalization type."})
     img_size: int = field(
         default=256,
@@ -341,16 +334,19 @@ class MyDataArguments(DataArguments):
         default=None,
         metadata={"help": "Path to the normalization stats file."},
     )
+    # prompt 使用全局任务描述还是子任务描述
     prompt_type: Literal["global", "subtask"] = field(
         default="global",
         metadata={"help": "Type of the prompt."},
     )
+    # 是否额外加载未来帧图像（future depth / future video 对齐需要）
     use_future_image: bool = field(
         default=False,
         metadata={"help": "Whether to use future image."},
     )
 
 
+# 顶层参数容器，对应 yaml 的 model / data / train / eval 四个段
 @dataclass
 class Arguments:
 
@@ -360,21 +356,29 @@ class Arguments:
     eval: "EvalArguments" = field(default_factory=EvalArguments)
 
 
+# 训练主流程
 def main():
+    # ===== 1. 解析参数 & 初始化分布式环境 =====
+    # 从命令行 / yaml 解析出 Arguments
     args = parse_args(Arguments)
     logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
     logger.info_rank0(json.dumps(asdict(args), indent=2))
+    # 每个进程绑定到自己的 GPU，并初始化 NCCL 进程组
     torch.cuda.set_device(f"cuda:{args.train.local_rank}")
     dist.init_process_group(backend="nccl")
+    # 设置随机种子（可选完全确定性）
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
+    # rank0 把最终参数保存到 output_dir，便于复现
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
 
+    # 根据数据并行模式（fsdp1 / fsdp2 等）和 ckpt_manager 选择 checkpoint 读写器
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
+    # 初始化并行拓扑：DP（replicate / shard）、TP、EP（专家并行）、PP、CP、Ulysses 序列并行
     init_parallel_state(
         dp_size=args.train.data_parallel_size,
         dp_replicate_size=args.train.data_parallel_replicate_size,
@@ -387,10 +391,13 @@ def main():
         dp_mode=args.train.data_parallel_mode,
     )
 
+    # ===== 2. 构建模型 =====
     logger.info_rank0("Prepare model")
+    # 模型 config 参数 = model 段 + train 段（train 段里也有 MoE、动作维度等结构参数）
     config_kwargs = {**vars(args.model), **vars(args.train)}
     config_registry = get_config_registry()
 
+    # config_key 在注册表中时，用注册的配置类构造 config；否则由 build_foundation_model 从 config_path 读取
     config_key = args.model.config_key
 
     if config_key in config_registry.supported_configs:
@@ -399,6 +406,7 @@ def main():
         logger.info_rank0(f"Successfully loaded: {config_cls.__class__.__name__}")
     else:
         config_cls = None
+    # 构建基础模型并加载权重；开启混合精度时参数保持 fp32，否则直接用 bf16
     model = build_foundation_model(
         config_path=args.model.config_path,
         config_cls=config_cls,
@@ -409,6 +417,8 @@ def main():
         config_kwargs=config_kwargs,
         moe_implementation=getattr(args.model, 'moe_implementation', None),
     )
+    # ===== 3. 可选：深度 / 未来视频特征对齐（教师模型蒸馏）=====
+    # align_params 非空即开启深度对齐；教师模型只做前向，为学生模型提供监督目标
     use_depth_align = True if args.train.align_params != {} else False
     use_future_depth = args.train.align_params.get('depth', {}).get('use_future_depth', False)
     use_future_video = use_depth_align and args.train.align_params.get('use_future_video', False)
@@ -417,6 +427,7 @@ def main():
     future_video_loss_weight = 1.0
     depth_loss_weight = 1.0
     future_depth_loss_weight = 1.0
+    # 未来视频对齐依赖未来帧图像；读取其 loss 权重（兼容多个旧配置字段名）
     if use_future_video:
         if not args.data.use_future_image:
             raise ValueError("align_params.use_future_video=True requires data.use_future_image=True.")
@@ -428,6 +439,7 @@ def main():
                 args.train.align_params.get("depth_loss_weight", 1.0),
             ),
         )
+    # 深度对齐：只支持 MoRGBD，加载 MoGe + MoRGBD 两个深度教师模型
     if use_depth_align:
         depth_model_type = args.train.align_params['depth']['model_type']
         if depth_model_type != 'MoRGBD':
@@ -439,24 +451,29 @@ def main():
         if args.train.use_compile:
             moge_model = torch.compile(moge_model)
             morgbd_model = torch.compile(morgbd_model)
+        # 可视化图片输出目录，默认 output_dir/images
         if 'visual_dir' not in args.train.align_params or not args.train.align_params['visual_dir']:
             args.train.align_params['visual_dir'] = os.path.join(args.train.output_dir, 'images')
         os.makedirs(args.train.align_params['visual_dir'], exist_ok=True)
+        # 加载未来视频教师模型
         if use_future_video:
             print('====Loading Future Video Model====')
             video_teacher = build_video_model(args.train.align_params['video'])
+    # 打印模型参数量统计（包含 MoE 专家参数）
     from lingbotvla.utils.moe_utils import log_model_param_stats
     log_model_param_stats(model)
 
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
+    # ===== 4. 构建数据 =====
     logger.info_rank0("Prepare data")
     processor = build_processor(args.model.tokenizer_path) # if use build_processor,  tokenizer is processor.tokenizer
 
     if args.train.rmpad:
         raise ValueError("Qwen2-VL does not support rmpad. Use `rmpad_with_pos_ids` instead.")
 
+    # 选择 collate 函数：VLA 数据用 VLADataCollatorWithPacking；其他多模态数据按是否 rmpad 选 packing / padding
     data_collate_fn = []
     if args.data.datasets_type == 'vla':
         data_collate_fn.append(VLADataCollatorWithPacking())
@@ -467,11 +484,13 @@ def main():
             data_collate_fn.append(OmniDataCollatorWithPadding())
     
     if args.data.dataloader_type == "native":
+        # 构建 VLA 数据集，并根据数据集大小计算每个 epoch 的 train_steps
         if args.data.datasets_type == 'vla':
             args.data.chunk_size = args.train.chunk_size
             train_dataset = build_vla_dataset(dataset_config=args.data, model_config=args.model, config=model.config, processor=processor, use_depth_align=use_depth_align)
             args.train.compute_train_steps(args.data.max_seq_len, args.data.train_size, len(train_dataset))
         
+        # 构建 dataloader：按 micro / global batch size 切分，支持动态 batch 和进度保存/恢复
         train_dataloader = build_dataloader(
             dataset=train_dataset,
             micro_batch_size=args.train.micro_batch_size,
@@ -494,32 +513,15 @@ def main():
     else:
         raise NotImplementedError(f"Unsupported dataloader type: {args.data.dataloader_type}.")
 
+    # ===== 5. 模型并行化（FSDP）=====
+    # 冻结 ViT；FSDP1 下部分参数冻结时需要 use_orig_params=True
     fsdp_kwargs = {}
     if args.train.freeze_vit:
         model.visual.requires_grad_(False)
         if args.train.data_parallel_mode == "fsdp1":
             fsdp_kwargs["use_orig_params"] = True
 
-    if args.train.use_lora:
-        if args.train.init_device == "meta":
-            raise ValueError("use_lora requires weights loaded before parallelization; set `init_device` to cuda or cpu.")
-        if args.train.enable_reentrant and args.train.enable_gradient_checkpointing:
-            raise ValueError("use_lora freezes the embeddings; reentrant checkpointing would drop gradients. Set `enable_reentrant: false`.")
-        lora_targets = apply_lora_and_freeze(
-            model,
-            lora_target_modules=args.train.lora_target_modules,
-            trainable_patterns=args.train.lora_trainable_patterns,
-            rank=args.train.lora_rank,
-            alpha=args.train.lora_alpha,
-            dropout=args.train.lora_dropout,
-        )
-        if not lora_targets:
-            raise ValueError(f"No nn.Linear matched lora_target_modules={args.train.lora_target_modules}.")
-        logger.info_rank0(f"LoRA injected into {len(lora_targets)} linear layers (rank={args.train.lora_rank}, alpha={args.train.lora_alpha}).")
-        logger.info_rank0(summarize_trainable_params(model))
-        if args.train.data_parallel_mode == "fsdp1":
-            fsdp_kwargs["use_orig_params"] = True
-
+    # 用 FSDP 包装模型，同时处理混合精度、梯度检查点、CPU offload、prefetch 等
     model = build_parallelize_model(
         model,
         enable_full_shard=args.train.enable_full_shard,
@@ -540,9 +542,12 @@ def main():
         use_future_image=args.data.use_future_image,
     )
     logger.info_rank0(model)
+    # 可选 torch.compile
     if args.train.use_compile:
         model = torch.compile(model)
 
+    # ===== 6. 优化器 & 学习率调度 =====
+    # 开启 MoE 专家 LR 放大时得到分组参数，否则为 None（使用默认分组）
     moe_param_groups = get_moe_param_groups(model, args.train)
     if moe_param_groups is not None:
         n_expert = sum(len(g["params"]) for g in moe_param_groups if g["lr"] != args.train.lr)
@@ -551,13 +556,13 @@ def main():
             f"MoE expert LR scaling enabled: {n_expert} expert param tensors use scaled LR. "
             f"Groups: {group_summary}"
         )
+    # Muon 优化器：矩阵参数用 Muon，1D 参数 / embedding 用 AdamW
     if args.train.optimizer == "muon":
         optimizer = build_muon_optimizer(
             model,
             args.train,
             lr=args.train.lr,
             weight_decay=args.train.weight_decay,
-            lora_lr=(args.train.lora_lr or args.train.lr) if args.train.use_lora else None,
         )
         muon_groups, adamw_groups = (
             optimizer.optimizers[0].param_groups,
@@ -568,15 +573,8 @@ def main():
         logger.info_rank0(
             f"Muon enabled. Muon groups: {muon_summary}; AdamW (1D/embed) groups: {adamw_summary}"
         )
+    # 其他优化器（由 args.train.optimizer 指定），可传入 MoE 参数分组
     else:
-        if args.train.use_lora:
-            lora_lr = args.train.lora_lr or args.train.lr
-            is_lora = lambda n: LORA_PARAM_PATTERN in n.rsplit(".", 1)[-1]
-            moe_param_groups = [
-                {"params": [p for n, p in model.named_parameters() if p.requires_grad and not is_lora(n)], "lr": args.train.lr},
-                {"params": [p for n, p in model.named_parameters() if p.requires_grad and is_lora(n)], "lr": lora_lr},
-            ]
-            moe_param_groups = [g for g in moe_param_groups if g["params"]]
         optimizer = build_optimizer(
             model,
             lr=args.train.lr,
@@ -587,6 +585,7 @@ def main():
             param_groups=moe_param_groups,
         )
 
+    # MoE：在 optimizer.step 之前注册 hook，根据各专家的 token 负载更新路由 bias（无辅助损失的负载均衡）
     # Register loss-free load balancing hook (before optimizer.step).
     # The hook also all-reduces and snapshots
     # last_tokens_per_expert (the global load used for monitoring). Setting
@@ -604,9 +603,11 @@ def main():
             f"update_interval={args.train.bias_update_interval})"
         )
 
+    # 总训练步数 = 每个 epoch 的步数 × epoch 数，并受 max_steps 截断
     total_train_steps = args.train.train_steps * args.train.num_train_epochs
     if args.train.max_steps is not None:
         total_train_steps = min(total_train_steps, args.train.max_steps)
+    # 学习率调度：warmup + 衰减（衰减方式由 lr_decay_style 决定）
     lr_scheduler = build_lr_scheduler(
         optimizer,
         train_steps=total_train_steps,
@@ -618,6 +619,8 @@ def main():
         lr_start=args.train.lr_start,
     )
 
+    # ===== 7. 日志 / profiler / 模型资产（只在 rank0）=====
+    # TensorBoard 异步写入，可选 wandb
     if args.train.global_rank == 0:
         log_dir=f"{args.train.output_dir}/runs/"
         writer = AsyncTBWriter(log_dir=log_dir)
@@ -627,6 +630,7 @@ def main():
                 config={**vars(args.model), **vars(args.data), **vars(args.train)},  # flatten dict
             )
 
+        # 可选 torch profiler
         if args.train.enable_profiling:
             profiler = helper.create_profiler(
                 start_step=args.train.profile_start_step,
@@ -638,12 +642,15 @@ def main():
             )
             profiler.start()
 
+        # 保存模型 config 和 processor，推理时加载模型需要用到
         model_assets = [model_config, processor]
         save_model_assets(args.train.model_assets_dir, model_assets)
 
+    # ===== 8. checkpoint 工具 & 断点续训 =====
     start_epoch, start_step, global_step = 0, 0, 0
     current_epoch_for_eval, current_epoch_step_for_eval = 1, 0
     save_checkpoint_path = None
+    # 异步 HF 权重保存器：在后台把分布式 checkpoint 转成 HuggingFace 格式权重，不阻塞训练
     hf_failure_log_path = (
         os.path.join(args.train.save_checkpoint_path, "async_hf_failures.jsonl")
         if args.train.save_checkpoint_path
@@ -657,6 +664,7 @@ def main():
         eval_args=args.eval,
     )
 
+    # 只在 rank0 提交 HF 权重转换任务；失败只记录日志，不影响训练（best effort）
     def save_hf_checkpoint_best_effort(
         checkpoint_path: str | None,
         checkpoint_state: Dict[str, Any],
@@ -680,6 +688,7 @@ def main():
             epoch_step=epoch_step,
         )
 
+    # 训练环境指标统计（吞吐等），也负责按 empty_cache_steps 定期清理显存
     environ_meter = helper.EnvironMeter(
         config=model_config,
         global_batch_size=args.train.global_batch_size,
@@ -688,6 +697,8 @@ def main():
         empty_cache_steps=args.train.empty_cache_steps,
     )
 
+    # 确定要恢复的 checkpoint：优先使用显式指定的 load_checkpoint_path；
+    # 否则在 enable_resume 时扫描 output_dir/checkpoints 下的 global_step_N，按步数从新到旧排序
     load_checkpoint_path = None
     candidates = []
     if args.train.load_checkpoint_path or args.train.enable_resume:
@@ -710,6 +721,7 @@ def main():
                 load_checkpoint_path = candidates[0]
             else:
                 logger.info_rank0(f"No checkpoints in {args.train.output_dir} now!")
+    # 依次尝试加载候选 checkpoint，失败则回退到更旧的一个
     if candidates:
         last_err = None
         loaded = False
@@ -717,6 +729,7 @@ def main():
             state = {"model": model, "ema": None, "optimizer": optimizer, "extra_state": {}}  # cannot be None
             try:
                 Checkpointer.load(cp, state, allow_partial_load=getattr(args.train, 'allow_partial_checkpoint', False))
+                # 恢复全局步数、lr scheduler、dataloader 进度、指标统计和随机数状态
                 global_step = state["extra_state"]["global_step"]
                 start_epoch = global_step // args.train.train_steps
                 start_step = global_step % args.train.train_steps
@@ -740,6 +753,8 @@ def main():
     else:
         logger.info_rank0("Starting training from scratch.")
 
+    # ===== 9. 训练循环 =====
+    # 构建激活值 offload 的前向 / 反向上下文
     helper.empty_cache()
     model_fwd_context, model_bwd_context = build_activation_offloading_context(
         args.train.enable_activation_offload, args.train.enable_gradient_checkpointing, args.train.activation_gpu_limit
@@ -751,6 +766,7 @@ def main():
     # create the path in advance to save loss log
     if args.train.global_rank == 0:
         os.makedirs(args.train.save_checkpoint_path, exist_ok=True)
+    # max_steps 小于总步数时，进度条按全局步数显示；否则每个 epoch 一个进度条
     reached_max_steps = False
     max_steps_driven = (
         args.train.max_steps is not None
@@ -763,8 +779,10 @@ def main():
             initial=global_step,
             disable=args.train.local_rank != 0,
         )
+    # ---- epoch 循环 ----
     for epoch in range(start_epoch, args.train.num_train_epochs):
         current_epoch_for_eval = epoch + 1
+        # 设置 epoch，使每个 epoch 的数据打乱顺序不同
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
 
@@ -777,18 +795,22 @@ def main():
                 disable=args.train.local_rank != 0,
             )
         data_iterator = iter(train_dataloader)
+        # ---- step 循环：每个 step 对应一次优化器更新 ----
         for epoch_step in range(start_step, args.train.train_steps):
             current_epoch_step_for_eval = epoch_step + 1
             global_step += 1
             try:
+                # 一个 step 取出一组 micro batch，用于梯度累积
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
                 logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.drop_last}")
                 break
 
+            # 第一步打印一个样本，方便检查数据是否正确
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
+            # 本 step 各项 loss 的累加器，以及对齐相关的中间结果
             total_loss, total_vla_loss, total_depth_loss, total_future_depth_loss, total_future_video_loss, total_seq_wise_loss, total_router_z_loss = 0, 0, 0, 0, 0, 0, 0
             depth_targets, depth_preds = None, None
             future_depth_targets, future_depth_preds = None, None
@@ -800,18 +822,22 @@ def main():
             ignore_batch_num = 0
             torch.cuda.synchronize()
             start_time = time.time()
+            # ---- 梯度累积：逐个 micro batch 做前向 + 反向 ----
             for micro_batch in micro_batches:
                 future_video_targets = None
                 future_video_current_preds = None
                 future_video_cls_targets = None
                 future_video_current_dino = None
+                # rep_id 是样本所属的数据集名，后面用来按数据集分别记录 loss
                 dataset_names = micro_batch.pop('rep_id', None)
                 environ_meter.add(micro_batch)
+                # 把张量搬到 GPU
                 micro_batch = {
                     k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in micro_batch.items()
                 }
                 future_video_effective_fps = micro_batch.pop('future_video_effective_fps', None)
                 depth_forward_time = 0
+                # 对齐模式：在 no_grad 下运行深度 / 视频教师模型，生成当前帧和未来帧的监督目标
                 if use_depth_align:
                     with torch.no_grad():
                         depth_start_time = time.time()
@@ -830,6 +856,7 @@ def main():
                                     args.train.align_params['video'],
                                     effective_fps=future_video_effective_fps,
                                 )
+                                # 兼容教师模型的不同返回格式：dict / tuple / 单个 tensor
                                 if isinstance(future_video_target_bundle, dict):
                                     future_video_targets = future_video_target_bundle["patch"]
                                     future_video_cls_targets = future_video_target_bundle.get("cls")
@@ -842,6 +869,7 @@ def main():
                             future_video_target_rgb = future_pil_images
                         depth_forward_time = time.time() - depth_start_time
 
+                # 学生模型前向：输入 batch 和各教师目标，返回总 loss 及各分项 loss
                 with model_fwd_context:
                     model_outputs = model(
                         **micro_batch,
@@ -851,6 +879,7 @@ def main():
                         future_video_cls_targets=future_video_cls_targets,
                         future_video_current_patch=future_video_current_dino,
                     )
+                    # 是否开启 future depth / future video 会改变返回元组的长度（6 / 8 / 10 / 11）
                     if len(model_outputs) == 6:
                         loss, vla_loss, depth_loss, seq_wise_loss, loss_log, depth_preds = model_outputs
                         future_depth_loss = 0
@@ -871,6 +900,7 @@ def main():
                     else:
                         raise ValueError(f"Unexpected model output length: {len(model_outputs)}")
 
+                    # 除以 micro batch 数，使梯度累积的结果等价于对整个 global batch 取平均
                     loss = loss / len(micro_batches)
                     vla_loss = vla_loss / len(micro_batches)
                     depth_loss = depth_loss / len(micro_batches)
@@ -880,9 +910,11 @@ def main():
                     router_z_loss = loss_log.get("router_z_loss", loss_log.get("moe_zloss/weighted", 0))
                     avg_lang_length = micro_batch['lang_masks'].sum(dim=-1).float().mean()
 
+                # 反向传播，梯度在 micro batch 之间累积
                 with model_bwd_context:
                     loss.backward()
 
+                # 累加用于日志的 loss 数值；未启用的分项是 int/float 类型的 0，跳过 .item()
                 total_loss += loss.item()
                 total_vla_loss += vla_loss.item()
                 if not (isinstance(depth_loss, int) or isinstance(depth_loss, float)):
@@ -896,6 +928,7 @@ def main():
                 if not (isinstance(router_z_loss, int) or isinstance(router_z_loss, float)):
                     total_router_z_loss += router_z_loss.item() / len(micro_batches)
                 del micro_batch
+            # 临时调试：设置环境变量 GATE_GRAD_PROBE=1 时，在前 12 步打印 MoE router 的梯度信息
             # --- TEMP gate-gradient probe (GATE_GRAD_PROBE=1): dump router gate grad
             # magnitude vs routed-expert grad, plus per-expert symmetry, pre-clip. ---
             if os.environ.get("GATE_GRAD_PROBE") and global_step < 12:
@@ -929,10 +962,13 @@ def main():
                                 f"[{_row.min():.1e},{_row.max():.1e}]{_eref}")
                 if args.train.local_rank == 0:
                     print(f"[GATE_GRAD_PROBE step={global_step}]\n  " + "\n  ".join(_lines), flush=True)
+            # ---- 梯度裁剪 + 参数更新 ----
+            # 超过 stable_train_steps 后改用 decayed_max_grad_norm 作为裁剪阈值
             if global_step > args.train.stable_train_steps:
                 max_grad_norm = args.train.decayed_max_grad_norm
             else:
                 max_grad_norm = args.train.max_grad_norm
+            # 按并行方式选择梯度裁剪实现：FSDP1 / 带专家并行的 FSDP2 / 通用实现
             if args.train.data_parallel_mode == "fsdp1":
                 grad_norm = model.clip_grad_norm_(max_grad_norm).item()
             elif hasattr(model, '_ep_param_set'):
@@ -941,19 +977,23 @@ def main():
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, foreach=True)
 
+            # 参数更新 → 学习率调度前进一步 → 清空梯度
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            # DTensor 形式的梯度范数需要先聚合成完整 tensor 再取值
             if hasattr(grad_norm, "full_tensor"):
                 grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
             total_loss, total_vla_loss, total_depth_loss, total_future_depth_loss, total_future_video_loss, total_seq_wise_loss, total_router_z_loss, avg_lang_length, grad_norm = all_reduce((total_loss, total_vla_loss, total_depth_loss, total_future_depth_loss, total_future_video_loss, total_seq_wise_loss, total_router_z_loss, avg_lang_length, grad_norm), group=get_parallel_state().fsdp_group)
+            # 深度 / 视频 loss 除以对应权重，日志里记录未加权的值
             total_depth_loss = total_depth_loss / depth_loss_weight
             total_future_depth_loss = total_future_depth_loss / future_depth_loss_weight
             total_future_video_loss = total_future_video_loss / future_video_loss_weight
             torch.cuda.synchronize()
             delta_time = time.time() - start_time
+            # 启用专家 LR 放大时有多个 lr：最小的是基础 lr，最大的是专家 lr
             all_lrs = lr_scheduler.get_last_lr()
             if args.train.use_moe_expert_lr and len(all_lrs) > 1:
                 lr = min(all_lrs)          # base (non-expert) lr
@@ -961,6 +1001,7 @@ def main():
             else:
                 lr = max(all_lrs)
                 expert_lr = None
+            # 更新指标统计和进度条，然后打印本步日志
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
             data_loader_tqdm.update()
             expert_lr_str = f"Expert_LR {expert_lr:.2e}, " if expert_lr is not None else ""
@@ -989,6 +1030,7 @@ def main():
             )
 
 
+            # ---- rank0 写 TensorBoard ----
             if args.train.global_rank == 0:
                 writer.add_scalar("training/loss", total_loss, global_step)
                 writer.add_scalar("training/vla_loss", total_vla_loss, global_step)
@@ -1009,6 +1051,7 @@ def main():
                     "moe_zloss/layer",     # per-layer raw router z-loss -> downsampled
                 )
 
+                # 把单元素 tensor 转成 python float；非标量返回 None，跳过不写
                 def _tb_scalar(value):
                     if torch.is_tensor(value):
                         if value.numel() != 1:
@@ -1016,6 +1059,7 @@ def main():
                         return value.detach().float().item()
                     return value
 
+                # 根据 key 前缀决定写入频率
                 for key, value in loss_log.items():
                     # every step: cross-layer summaries + seq-wise average + legacy V1 keys
                     if (key.startswith("moe_summary/")
@@ -1032,6 +1076,7 @@ def main():
                         scalar = _tb_scalar(value)
                         if scalar is not None:
                             writer.add_scalar(key, scalar, global_step)
+                # 把 align/* 下的视频 loss 额外写一份到 training/* 下，方便查看
                 align_training_aliases = {
                     "align/current_video_loss": "training/current_video_loss",
                     "align/current_video_loss_weighted": "training/current_video_loss_weighted",
@@ -1080,6 +1125,7 @@ def main():
                 writer.add_scalar("training/avg_lang_length", avg_lang_length, global_step)
                 writer.add_scalar("training/max_norm_batch", ignore_batch_num, global_step)
                 writer.add_scalar("steptime", delta_time, global_step)
+                # 按数据集分组记录 loss
                 # we only log the last mini batch if grad acc is activated
                 if dataset_names is not None and 'batch_mean_losses' in loss_log:
                     batch_mean_losses = loss_log['batch_mean_losses']  # shape (B,)
@@ -1094,6 +1140,7 @@ def main():
                         mean_loss = sum(values) / len(values)
                         writer.add_scalar(f"detailed_loss/{name}", mean_loss, global_step)
 
+                # profiler 前进一步，到达结束步时停止并上传 trace
                 if args.train.enable_profiling and global_step <= args.train.profile_end_step:
                     profiler.step()
                     if global_step == args.train.profile_end_step:
@@ -1118,6 +1165,7 @@ def main():
                 # except Exception as e:
                 #     logger.info_rank0(f"⚠️ Failed to write loss.jsonl: {e}")
 
+                # 每 visual_steps 步可视化一次未来视频预测
                 if use_depth_align:
                     if global_step % args.train.align_params['visual_steps'] == 0:
                         with torch.no_grad():
@@ -1134,6 +1182,7 @@ def main():
                                     current_pred_feats=future_video_current_preds,
                                 )
 
+            # ---- 每 save_steps 步保存一次分布式 checkpoint ----
             if args.train.save_steps and global_step % args.train.save_steps == 0:
                 helper.empty_cache()
                 save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
@@ -1148,6 +1197,7 @@ def main():
                 #         else:
                 #             print("⚠️ Unidentified parameter in optimizer state")
 
+                # checkpoint 内容：模型、优化器，以及恢复训练所需的额外状态
                 state = {
                     "model": model,
                     "ema": None,
@@ -1162,6 +1212,7 @@ def main():
                 }
                 if args.train.global_rank == 0:
                     writer.flush()
+                # 所有 rank 一起写分布式 checkpoint，然后提交异步 HF 权重转换
                 Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
@@ -1173,17 +1224,21 @@ def main():
                     current_epoch_step_for_eval,
                 )
 
+            # 达到 max_steps 后提前结束
             if args.train.max_steps is not None and global_step >= args.train.max_steps:
                 logger.info_rank0(f"Reached max_steps={args.train.max_steps}, stopping training.")
                 reached_max_steps = True
                 break
 
+        # ---- epoch 结束 ----
         if not max_steps_driven:
             data_loader_tqdm.close()
         if args.train.global_rank == 0:
             writer.flush()
+        # 之后的 epoch 从第 0 步开始（只有恢复训练的那个 epoch 从 start_step 开始）
         start_step = 0
         helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
+        # 因 max_steps 结束：如果最后一步还没保存过就补存一次，然后退出 epoch 循环
         if reached_max_steps:
             already_saved = args.train.save_steps and global_step % args.train.save_steps == 0
             if not already_saved:
@@ -1212,6 +1267,7 @@ def main():
                     current_epoch_step_for_eval,
                 )
             break
+        # 每 save_epochs 个 epoch 结束时保存一次
         if args.train.save_epochs and (epoch + 1) % args.train.save_epochs == 0:
             helper.empty_cache()
             save_checkpoint_path = os.path.join(args.train.save_checkpoint_path, f"global_step_{global_step}")
@@ -1238,6 +1294,7 @@ def main():
                 current_epoch_step_for_eval,
             )
 
+    # ===== 10. 收尾 =====
     if max_steps_driven:
         data_loader_tqdm.close()
     if args.train.global_rank == 0:
@@ -1255,8 +1312,10 @@ def main():
             current_epoch_for_eval,
             current_epoch_step_for_eval,
         )
+    # 等待所有 rank 的异步 HF 保存任务完成
     hf_saver.wait_all_across_ranks()
 
+    # 同步后销毁进程组
     dist.barrier()
     dist.destroy_process_group()
 

@@ -1,0 +1,168 @@
+# 单卡 H100 (80GB) LoRA 微调（方案 B），基于 galaxea_r1lite_stack_blocks_lora.yaml
+# 启动：CUDA_VISIBLE_DEVICES=0 bash train.sh tasks/vla/train_lingbotvla.py configs/vla/real_robot/galaxea_r1lite_stack_blocks_lora_1xh100.yaml
+model:
+  model_path: lingbot-vla/lingbot-vla-v2-6b
+  tokenizer_path: lingbot-vla/Qwen3-VL-4B-Instruct
+  post_training: true
+  adanorm_time: true
+  config_key: LingbotVLAV2Config
+  moe_implementation: fused
+
+data:
+  datasets_type: vla
+  data_name: galaxea_r1lite_stack_block   # 单数据集模式：取 configs/robot_configs/galaxea_r1lite_stack_block.yaml
+  train_path: dataset/stack_the_blocks
+  robot_config_root: configs/robot_configs
+  norm_stats_file: assets/norm_stats/galaxea_r1lite_stack_blocks.json
+  joints:                            # 保持与预训练一致，本任务只用到 arm.position(12) 与 effector.position(2)
+    - arm.position: 14
+    - end.position: 14
+    - effector.position: 2
+    - waist.position: 4
+    - head.position: 2
+    - base.position: 3
+    - hand.position: 12
+  cameras:
+    - camera_top
+    - camera_wrist_left
+    - camera_wrist_right
+  norm_type:
+    - arm.position: meanstd
+    - end.position: meanstd
+    - effector.position: meanstd
+    - waist.position: meanstd
+    - head.position: meanstd
+    - base.position: meanstd
+    - hand.position: meanstd
+  num_workers: 8
+  use_future_image: true
+
+train:
+  output_dir: output/galaxea_r1lite_stack_blocks_lora_1xh100   # 独立目录，避免 enable_resume 误加载其他实验的 ckpt
+  # ---------------- LoRA（方案 B） ----------------
+  # 先冻结全部参数，再：VLM LLM 的 attn/mlp 加 LoRA；下面 lora_trainable_patterns 命中的参数全量训练；
+  # 其余（ViT、embed_tokens、routed experts、router、VLM norm）保持冻结。
+  use_lora: true
+  lora_rank: 32
+  lora_alpha: 32                        # 缩放 = alpha / rank = 1.0
+  lora_dropout: 0.0
+  lora_lr: 1.0e-4                       # LoRA 参数固定走 AdamW；全量部分仍用下面的 lr/optimizer
+  lora_target_modules:                  # 正则，匹配 module 全名（re.search）
+    - 'qwenvl\.model\.language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)$'
+  lora_trainable_patterns:              # 正则，匹配 param 全名（re.search），这些参数全量训练
+    - 'qwen_expert\.model\.layers\.\d+\.self_attn\.'                       # 动作专家 attention
+    - 'qwen_expert\.model\.layers\.\d+\.mlp\.shared_expert\.'             # 共享专家
+    - 'qwen_expert\.model\.layers\.\d+\.(input|post_attention)_layernorm\.'  # AdaRMSNorm（含 gamma/beta）
+    - 'qwen_expert\.model\.norm\.'
+    - 'model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out)\.'
+    - '_align_head\.|_align_embs|_shared_task_proj\.'                        # depth/video 对齐头
+  moe_monitor_interval: 1000
+  enable_gradient_checkpointing: true   # 先开保证跑通；实测显存有余再关掉提速
+  precompute_grid_thw: true
+  vlm_causal: true
+  vlm_fsdp: true
+  attention_implementation: flex_cached
+  use_moe: true
+  token_moe_layers: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35]
+  token_num_experts: 32
+  token_top_k: 4
+  token_moe_intermediate_size: 512
+  token_shared_intermediate_size: 704
+  bias_update_speed: 0
+  sequence_wise_mode: "per_sequence"
+  sequence_wise_loss_coeff: 0         # router 已冻结，均衡 loss 只会反向扭曲上游表征，关掉
+  router_z_loss_coeff: 0
+  router_activation: "sigmoid"
+  routed_scaling_factor: 4.0
+  use_shared_expert_gate: false
+  use_moe_expert_lr: false             # routed experts 冻结，不需要专家学习率缩放
+  data_parallel_mode: fsdp2
+  enable_full_shard: false              # 单卡无分片可言，关掉避免每层重复 unshard 的开销
+  module_fsdp_enable: true
+  use_compile: true
+  use_wandb: false
+  rmpad: false
+  rmpad_with_pos_ids: false
+  ulysses_parallel_size: 1
+  freeze_vision_encoder: true          # ViT 冻结并保持 eval 模式
+  tokenizer_max_length: 72
+  action_dim: 55
+  max_action_dim: 55
+  max_state_dim: 55
+  optimizer: muon
+  lr: 5.0e-5
+  lr_decay_style: constant
+  num_train_epochs: 29000
+  micro_batch_size: 4                   # 预估固定显存 ~36GB，4 保守起步；看峰值再抬到 8
+  gradient_accumulation_steps: 16       # 4 × 1 卡 × 16 = 64，与 8 卡实验等效 batch
+  global_batch_size: 64                 # 必须 == micro * 1 * grad_accum，否则启动即报错
+                                        # 抬 micro 到 8 时 grad_accum 改 8；嫌慢可降到 32（accum 8）
+  max_steps: 10000                      # 163894 帧 / 64 ≈ 2561 步一个 epoch，10000 步 ≈ 3.9 epoch
+  ckpt_manager: dcp
+  save_steps: 1000                     # 数据量较大，每 ~0.4 epoch 存一次
+  save_epochs: 29000
+  enable_fp32: false                    # bf16 计算：H100 上明显更快、激活更省；master 权重/梯度规约仍是 fp32
+  enable_resume: true
+  align_params:
+    mode: 'query'
+    num_task_tokens: 8
+    depth_loss_weight: 0.004
+    future_depth_loss_weight: 0.004
+    use_future_video: true
+    llm:
+      dim_out: 2560
+      image_token_size: 8
+      image_input_size: 224
+    depth:
+      model_type: MoRGBD
+      moge_path: lingbot-vla/moge-2-vitb-normal/model.pt
+      morgbd_path: lingbot-vla/lingbot-vla-v2-6b/depth/model.pt
+      num_layers: 1
+      num_heads: 4
+      dim_head: 32
+      ff_mult: 1
+      num_backbone_tokens: 256
+      token_size: 16
+      dim_out: 1024
+      input_size: 224
+      use_future_depth: true
+      block_future_depth_to_action: false
+      detach_future_image_feats: true
+    video:
+      ckpt_path: lingbot-vla/lingbot-vla-v2-6b/dino_video/teacher_step_10000.pth
+      config_path: lingbot-vla/lingbot-vla-v2-6b/dino_video/config.yaml
+      attention_mode: flex_block_causal
+      input_size: 256
+      block_suffix_to_future_video: false
+      share_future_depth_query: true
+      use_shared_future_task_proj: true
+      use_current_shared_task_proj: true
+      num_future_frames: 1
+      # Keeps DINO teacher input as [warmup current, current, future].
+      # Current-DINO target uses current_index=1 in code.
+      use_warmup_frame: true
+      effective_fps: 1.0
+      n_blocks: 1
+      cls_pool: last
+      detach_image_feats: true
+      num_layers: 1
+      num_heads: 4
+      dim_head: 32
+      ff_mult: 1
+      num_backbone_tokens: 256
+      dim_out: 1024
+      future_video_loss_weight: 0.004
+      use_smooth_l1_loss: false
+      use_mse_loss: true
+      mse_loss_weight: 1.0
+      # Enables current-DINO patch alignment and current depth/DINO shared query projection.
+      use_patch_loss: true
+      use_current_patch_loss: true
+      use_cosine_loss: true
+      cosine_loss_weight: 0.2
+      use_cls_loss: false
+      cls_loss_type: mse
+      cls_loss_weight: 0.2
+      log_max_samples: 32
+      log_scale: 16
+    visual_steps: 1000                  # 深度/视频蒸馏可视化间隔，需 < max_steps 才会触发
