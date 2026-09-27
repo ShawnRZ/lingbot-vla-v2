@@ -1,13 +1,23 @@
 data:
   datasets_type: vla
-  data_name: multi
-  robot_name: galaxea_r1lite
-  train_path: 
+  data_name: galaxea_r1lite_stack_block     # 单数据集：直接写 robot config 名
+  train_path: dataset/stack_the_blocks
   robot_config_root: configs/robot_configs
-  norm_path: 
+  norm_path: assets/norm_stats/galaxea_r1lite_stack_blocks.json
   num_workers: 8
   prompt_type: global
-  
+  joints:                                   # 与训练 yaml 保持一致
+    - arm.position: 14
+    - end.position: 14
+    - effector.position: 2
+    - waist.position: 4
+    - head.position: 2
+    - base.position: 3
+    - hand.position: 12
+  cameras:
+    - camera_top
+    - camera_wrist_left
+    - camera_wrist_right
 
 train:
   micro_batch_size: 48

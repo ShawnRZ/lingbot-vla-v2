@@ -1,0 +1,35 @@
+# 适用于 dataset/stack_the_block：state/action 布局为 [左臂6, 左夹爪, 右臂6, 右夹爪]
+# （与 galaxea_r1lite.yaml 对应的 [左臂6, 右臂6, 左夹爪, 右夹爪] 不同）
+states:
+  - observation.state.arm.position:
+      origin_keys:
+        - observation.state: {start: 0, end: 6}
+        - observation.state: {start: 7, end: 13}
+  - observation.state.effector.position:
+      origin_keys:
+        - observation.state: {start: 6, end: 7}
+        - observation.state: {start: 13, end: 14}
+
+actions:
+  - action.arm.position:
+      origin_keys:
+        - action: {start: 0, end: 6}
+        - action: {start: 7, end: 13}
+      subtract_state: true     # 真机数据官方推荐 true（学相对增量）
+      # 关节空间必须显式置 null：默认值 quaternion_local 会走末端位姿的四元数相对变换
+      relative_type: null
+  - action.effector.position:
+      origin_keys:
+        - action: {start: 6, end: 7}
+        - action: {start: 13, end: 14}
+      subtract_state: false
+
+images:
+  - observation.images.camera_top:
+      origin_keys: observation.images.head_left
+  - observation.images.camera_wrist_left:
+      origin_keys: observation.images.wrist_left
+  - observation.images.camera_wrist_right:
+      origin_keys: observation.images.wrist_right
+
+norm_stats: assets/norm_stats/galaxea_r1lite_stack_blocks.json
