@@ -511,6 +511,65 @@ class FeatureTransform:
         item = self.reverse_features(item)
         return item
 
+    def rebase_normalized_actions(self, actions, old_item, new_item, shift):
+        """Re-express a normalized model action chunk for a later observation (used by RTC).
+
+        ``actions`` (chunk, max_action_dim) was predicted for ``old_item``; ``shift`` actions of it
+        have been executed since. Returns the chunk shifted by ``shift`` steps, relative to the
+        state in ``new_item`` and normalized again. Shifting happens in unnormalized space because
+        action norm stats may be per time step. Positions past the old chunk's end repeat its last
+        action; RTC gives them zero weight.
+        """
+        def to_features(item):
+            item = {
+                'actions': actions.float(),
+                'state': item['state'].float(),
+                'state_joint_mask': item['state_joint_mask'],
+                'action_joint_mask': item['action_joint_mask'],
+            }
+            item = self.reverse_pad_and_concat(item)
+            if self.normalizer is not None:
+                item = self.normalizer.unnormalize(item)
+            return item
+
+        old_features = to_features(old_item)
+        new_features = to_features(new_item)
+
+        chunk_size = actions.shape[0]
+        index = torch.arange(chunk_size).add(shift).clamp(max=chunk_size - 1)
+        rebased = {}
+        for action_feature in self.actions:
+            value = torch.as_tensor(old_features[action_feature], dtype=torch.float32)
+            if self.action_subtract_state[action_feature]:
+                state_feature = action_feature.replace('action.', 'observation.state.')
+                old_state = torch.as_tensor(old_features[state_feature], dtype=torch.float32)
+                new_state = torch.as_tensor(new_features[state_feature], dtype=torch.float32)
+                relative_type = self.action_relative_type.get(action_feature)
+                if _is_quaternion_relative_type(relative_type):
+                    value = absolute_pose_quaternion(value, old_state, relative_type=relative_type)
+                    value = relative_pose_quaternion(value[index], new_state, relative_type=relative_type)
+                else:
+                    value = value[index] + old_state - new_state
+            else:
+                value = value[index]
+            rebased[action_feature] = value
+
+        if self.normalizer is not None:
+            rebased = self.normalizer.normalize(rebased)
+
+        # Inverse of the action slicing in reverse_pad_and_concat; padded dims are just shifted.
+        out = actions.float()[index].clone()
+        action_joint_mask = old_item['action_joint_mask']
+        out[:, action_joint_mask] = torch.cat(
+            [
+                torch.as_tensor(rebased[f'action.{k}'], dtype=torch.float32)
+                for k in self.feature_config.joints
+                if f'action.{k}' in self.actions
+            ],
+            dim=-1,
+        )
+        return out
+
     def reverse_pad_and_concat(self, item):
         reverse_item = {}
 

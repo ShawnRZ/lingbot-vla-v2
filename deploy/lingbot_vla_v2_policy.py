@@ -100,6 +100,7 @@ class PolicyPreprocessMixin:
         use_compile: bool = False,
         capture_time: bool = False,
         sample_compile_fn: callable = None,
+        rtc_kwargs: dict = None,
     ) -> Tensor:
         """Run one model forward for a batch of already-transformed observations.
 
@@ -162,6 +163,10 @@ class PolicyPreprocessMixin:
                 gpu_times = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
                 print(f"sample_actions avg time: {sum(gpu_times)/len(gpu_times):.4f} ms, min time: {min(gpu_times):.4f} ms, max time: {max(gpu_times):.4f} ms")
         else:
+            if rtc_kwargs:
+                # RTC calls autograd.grad inside the denoising loop, which a compiled
+                # sample_actions cannot trace; the inner modules may still be compiled.
+                sample_compile_fn = self.model.sample_actions
             actions = sample_compile_fn(
                             images.to(dtype=dtype, device=device),
                             img_masks.to(device=device),
@@ -169,6 +174,7 @@ class PolicyPreprocessMixin:
                             lang_masks.to(device=device),
                             state.to(dtype=dtype, device=device),
                             image_grid_thw=self._to_device_image_grid_thw(image_grid_thw, device),
+                            **(rtc_kwargs or {}),
             )
 
         delta_time = time.time() - s1
@@ -196,6 +202,7 @@ class LingbotVLAv2Server:
         use_bf16=True,
         use_fp32=False,
         use_compile=False,
+        rtc_max_guidance=5.0,
     ) -> None:
         assert not (use_bf16 and use_fp32), 'Bfloat16 or Float32!!!'
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
@@ -203,6 +210,11 @@ class LingbotVLAv2Server:
         self.use_length = use_length
         self.chunk_ret = chunk_ret
         self.robot_norm_path = robot_norm_path
+        self.rtc_max_guidance = rtc_max_guidance
+        # Full-length normalized chunk from the last forward and the transformed observations it
+        # was predicted from, used to build the RTC guidance target.
+        self.rtc_prev_chunk = None
+        self.rtc_prev_applied = None
 
         self.task_description = None
 
@@ -318,7 +330,9 @@ class LingbotVLAv2Server:
         self.vla = LingBotVlaV2InferencePolicy(config, eval=True)
 
         self.load_model_weights(path_to_pi_model, strict=True)
-        
+        # Inference only: RTC backprops to x_t, so frozen weights skip needless weight grads.
+        self.vla.requires_grad_(False)
+
         self.vla.feature_transform = None
         self.data_config = data_config
         self.config = config
@@ -349,6 +363,8 @@ class LingbotVLAv2Server:
         self.global_step = 0
         self.last_action_chunk = None
         self.last_normalized_action_chunk = None
+        self.rtc_prev_chunk = None
+        self.rtc_prev_applied = None
 
         robot_config = f'configs/robot_configs/{robo_name}.yaml'
         
@@ -432,7 +448,35 @@ class LingbotVLAv2Server:
             return torch.stack(padded, dim=0)
 
         raise ValueError(f"Cannot batch tensors with different shapes: {shapes}")
-    def _infer_batch(self, observations, return_normalized=False):
+    def _build_rtc_kwargs(self, executed_steps, inference_delay, applied):
+        """Re-express the previous chunk so that index 0 aligns with the current observation."""
+        if self.rtc_prev_chunk is None:
+            return None
+        prev = self.rtc_prev_chunk
+        if prev.shape[0] != len(applied):
+            raise ValueError(f"RTC batch size changed from {prev.shape[0]} to {len(applied)}; reset first.")
+        chunk_size = prev.shape[1]
+        if not 0 <= executed_steps <= chunk_size - inference_delay:
+            raise ValueError(
+                f"rtc_executed_steps={executed_steps} with rtc_inference_delay={inference_delay} "
+                f"exceeds chunk_size={chunk_size}"
+            )
+        # Shift in unnormalized space and, for subtract_state actions, rebase onto the new state.
+        shifted = torch.stack([
+            self.vla.feature_transform.rebase_normalized_actions(
+                prev_actions, prev_item, new_item, executed_steps
+            )
+            for prev_actions, prev_item, new_item in zip(prev, self.rtc_prev_applied, applied)
+        ])
+        return dict(
+            prev_chunk=shifted,
+            rtc_action_mask=torch.stack([item['action_joint_mask'] for item in applied]),
+            inference_delay=inference_delay,
+            execute_horizon=executed_steps,
+            rtc_max_guidance=self.rtc_max_guidance,
+        )
+
+    def _infer_batch(self, observations, return_normalized=False, rtc=None):
         if not isinstance(observations, (list, tuple)) or len(observations) == 0:
             raise ValueError("batch observation must be a non-empty list")
         applied = [self._prepare_model_input(obs) for obs in observations] # bsize, dict{key }
@@ -445,13 +489,20 @@ class LingbotVLAv2Server:
             else:
                 batch_observation[key] = values
 
+        rtc_kwargs = None
+        if rtc is not None:
+            rtc_kwargs = self._build_rtc_kwargs(*rtc, applied=applied)
         actions = self.vla.sample_actions_batch(
             batch_observation,
             self.use_bf16,
             self.use_compile,
             capture_time=False,
             sample_compile_fn = self.sample_actions_fn,
+            rtc_kwargs=rtc_kwargs,
         )
+        if rtc is not None:
+            self.rtc_prev_chunk = actions
+            self.rtc_prev_applied = applied
         
         unnormalized_actions = self._unapply_batched_actions(applied, actions)
         if return_normalized:
@@ -469,6 +520,15 @@ class LingbotVLAv2Server:
 
         is_batch = 'batch' in observation
         observations = observation['batch'] if is_batch else [observation]
+        # RTC: the client reports how many actions of the last returned chunk had been executed
+        # when this observation was taken, and how many more it will execute while waiting.
+        rtc = None
+        if 'rtc_executed_steps' in observation:
+            if not self.chunk_ret:
+                raise ValueError("RTC requires chunk_ret=True so the client executes chunks itself.")
+            rtc = (int(observation['rtc_executed_steps']), int(observation.get('rtc_inference_delay', 0)))
+            if not is_batch:
+                observations = [{k: v for k, v in observation.items() if not k.startswith('rtc_')}]
         if not self.chunk_ret and self.use_length <= 0:
             raise ValueError(f"use_length must be > 0 when chunk_ret=False, got {self.use_length}")
         should_forward = (
@@ -484,9 +544,10 @@ class LingbotVLAv2Server:
                 unnormalized_actions, normalized_actions = self._infer_batch(
                     observations,
                     return_normalized=True,
+                    rtc=rtc,
                 )
             else:
-                unnormalized_actions = self._infer_batch(observations)
+                unnormalized_actions = self._infer_batch(observations, rtc=rtc)
                 normalized_actions = None
             if self.use_length > 0:
                 for output_key in unnormalized_actions.keys():
@@ -590,6 +651,13 @@ def main():
         default=True,
     )
 
+    parser.add_argument(
+        "--rtc_max_guidance",
+        type=float,
+        default=5.0,
+        help="RTC guidance weight clip (beta); RTC is enabled per request via rtc_executed_steps"
+    )
+
     args = parser.parse_args()
 
     model = LingbotVLAv2Server(
@@ -599,6 +667,7 @@ def main():
         use_bf16=args.use_bf16,
         use_fp32=args.use_fp32,
         use_compile=args.use_compile,
+        rtc_max_guidance=args.rtc_max_guidance,
     )
     model_server = WebsocketPolicyServer(model, port=args.port)
     model_server.serve_forever()

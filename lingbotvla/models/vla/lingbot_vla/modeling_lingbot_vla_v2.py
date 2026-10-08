@@ -1,4 +1,5 @@
 import einops
+import math
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -926,8 +927,22 @@ class FlowMatchingV2(FlowMatchingV1):
         state,
         noise=None,
         image_grid_thw=None,
+        prev_chunk=None,
+        rtc_action_mask=None,
+        inference_delay=0,
+        execute_horizon=None,
+        rtc_max_guidance=5.0,
     ) -> Tensor:
-        """Do a full Qwen3-VL inference forward and compute the action."""
+        """Do a full Qwen3-VL inference forward and compute the action.
+
+        Real-Time Chunking (RTC, Black et al. 2025) is enabled when ``prev_chunk`` is given:
+        ``prev_chunk`` is the previous normalized chunk shifted so that index 0 aligns with the
+        current observation, ``execute_horizon`` is how many actions of the previous chunk had been
+        executed when this observation was taken, and ``inference_delay`` is how many more actions
+        will be executed before this chunk arrives. The overlap is inpainted via guided denoising.
+        ``rtc_action_mask`` (bsize, max_action_dim) restricts guidance to real action dims so the
+        padded dims do not leak into them through the Jacobian.
+        """
         bsize = state.shape[0]
         device = state.device
         dtype = state.dtype
@@ -984,22 +999,83 @@ class FlowMatchingV2(FlowMatchingV1):
                 )
                 self._compiled_predict_velocity = predict_velocity_fn
 
+        if prev_chunk is not None:
+            if execute_horizon is None:
+                raise ValueError("RTC requires execute_horizon when prev_chunk is given.")
+            prev_chunk = prev_chunk.to(device=device, dtype=dtype)
+            rtc_weights = get_rtc_prefix_weights(
+                self.config.n_action_steps, inference_delay, execute_horizon, device=device, dtype=dtype
+            )[None, :, None]
+            if rtc_action_mask is not None:
+                rtc_weights = rtc_weights * rtc_action_mask.to(device=device, dtype=dtype)[:, None, :]
+
         while time >= -dt / 2:
             count += 1
             expanded_time = time.expand(bsize)
-            v_t = predict_velocity_fn(
-                state,
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-                prefix_position_ids=prefix_position_ids,
-            )
+            if prev_chunk is None:
+                v_t = predict_velocity_fn(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    expanded_time,
+                    prefix_position_ids=prefix_position_ids,
+                )
+            else:
+                v_t = self._rtc_guided_velocity(
+                    predict_velocity_fn,
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_t,
+                    time,
+                    prefix_position_ids,
+                    prev_chunk,
+                    rtc_weights,
+                    rtc_max_guidance,
+                )
 
             x_t += dt * v_t
             time += dt
         print(f"Denoise {count} steps")
         return x_t
+
+    def _rtc_guided_velocity(
+        self,
+        predict_velocity_fn,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        x_t,
+        time,
+        prefix_position_ids,
+        prev_chunk,
+        rtc_weights,
+        max_guidance,
+    ):
+        """Pseudo-inverse guided velocity that pulls the denoised chunk towards ``prev_chunk``."""
+        with torch.enable_grad():
+            x_t = x_t.detach().requires_grad_(True)
+            v_t = predict_velocity_fn(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                time.expand(x_t.shape[0]),
+                prefix_position_ids=prefix_position_ids,
+            )
+            # time=1 is pure noise and time=0 is clean actions, so v_t ~= noise - actions.
+            x0_hat = x_t - time * v_t
+            err = (prev_chunk - x0_hat) * rtc_weights
+            (grad,) = torch.autograd.grad(x0_hat, x_t, grad_outputs=err.to(x0_hat.dtype))
+
+        # The RTC paper uses tau = 1 - time (tau=0 noise, tau=1 clean):
+        # guidance = min(beta, (1 - tau) / (tau * r^2)), r^2 = (1 - tau)^2 / (tau^2 + (1 - tau)^2).
+        tau = 1.0 - time.float()
+        guidance = (tau**2 + (1 - tau) ** 2) / (tau * (1 - tau)).clamp_min(1e-6)
+        guidance = guidance.clamp(max=max_guidance).to(v_t.dtype)
+        # Our velocity points from actions to noise, i.e. the negative of the paper's.
+        return v_t.detach() - guidance * grad
 
     def predict_velocity(
         self,
@@ -1319,10 +1395,28 @@ class LingbotVlaV2Policy(PreTrainedModel):
         return self.model.sample_actions(*args, **kwargs)
 
 
+def get_rtc_prefix_weights(chunk_size, inference_delay, execute_horizon, device=None, dtype=None):
+    """Soft-mask weights from RTC (Black et al. 2025, Eq. 5).
+
+    The first ``inference_delay`` actions are frozen (weight 1), the remaining overlap with the
+    previous chunk decays exponentially, and actions past the previous chunk's end get weight 0.
+    """
+    H, d, s = chunk_size, inference_delay, execute_horizon
+    if not (0 <= d and 0 <= s and d + s <= H):
+        raise ValueError(f"RTC needs 0 <= inference_delay, 0 <= execute_horizon and their sum <= chunk_size, got d={d}, s={s}, H={H}")
+    i = torch.arange(H, device=device, dtype=torch.float32)
+    c = (H - s - i) / (H - s - d + 1)
+    w = c * torch.expm1(c) / (math.e - 1)
+    w = torch.where(i < d, torch.ones_like(w), w)
+    w = torch.where(i >= H - s, torch.zeros_like(w), w)
+    return w.to(dtype) if dtype is not None else w
+
+
 ModelClass = LingbotVlaV2Policy
 
 __all__ = [
     "LingbotVlaV2Policy",
+    "get_rtc_prefix_weights",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLTextModel",
     "Qwen3VLPreTrainedModel",
