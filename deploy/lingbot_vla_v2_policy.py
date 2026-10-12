@@ -340,7 +340,8 @@ class LingbotVLAv2Server:
         self.vla.model._compiled_predict_velocity = None
         self.sample_actions_fn = self.vla.model.sample_actions
         if self.use_compile:
-            self.vla.model.qwenvl_with_expert = torch.compile(self.vla.model.qwenvl_with_expert)
+            # Do not also compile qwenvl_with_expert on its own: nested inside the compiled
+            # predict_velocity (used by RTC) it gets split into one small graph per layer.
             self.sample_actions_fn = torch.compile(self.vla.model.sample_actions)
 
         if self.robot_norm_path is None:
@@ -376,6 +377,42 @@ class LingbotVLAv2Server:
         # Load data processors
         self.vla.feature_transform = feature_transform
         self.action_key = feature_transform.org_features["actions"]
+
+    def _dummy_observation(self):
+        """A zero observation in the raw (pre-FeatureTransform) format of the current robot config."""
+        feature_transform = self.vla.feature_transform
+        observation = {'task': 'warmup'}
+        for image_key in feature_transform.org_features['images']:
+            observation[image_key] = np.zeros((224, 224, 3), dtype=np.uint8)
+        state_dims = {}
+        for state_feature in feature_transform.states:
+            origin_keys = feature_transform.key_mapping.get(state_feature, {}).get('origin_keys')
+            if isinstance(origin_keys, dict):
+                for origin_key, info in origin_keys.items():
+                    origin_key = origin_key.split('*')[0]
+                    state_dims[origin_key] = max(state_dims.get(origin_key, 0), info['end'])
+            else:
+                origin_key = origin_keys if isinstance(origin_keys, str) else state_feature
+                state_dims[origin_key] = feature_transform.normalizer.norm_stats[state_feature]['mean'].shape[-1]
+        for state_key, dim in state_dims.items():
+            observation[state_key] = np.zeros((dim,), dtype=np.float32)
+        return observation
+
+    def warmup(self, robo_name):
+        """Run the plain and RTC sampling paths once so torch.compile happens before serving."""
+        self.reset(robo_name=robo_name)
+        observation = self._dummy_observation()
+        start = time.time()
+        self.infer(dict(observation))
+        print(f'Warmup plain inference done in {time.time() - start:.1f} s')
+        if self.chunk_ret:
+            rtc_observation = dict(observation, rtc_executed_steps=0, rtc_inference_delay=0)
+            start = time.time()
+            self.infer(dict(rtc_observation))  # stores the previous chunk
+            self.infer(dict(rtc_observation))  # guided denoising: compiles predict_velocity with grad
+            print(f'Warmup RTC inference done in {time.time() - start:.1f} s')
+        self.reset(robo_name=robo_name)
+
     def resize_image(self, observation):
         image_features  = self.vla.feature_transform.org_features['images']
         image_size = getattr(self.data_config, 'img_size', 256)
@@ -658,6 +695,13 @@ def main():
         help="RTC guidance weight clip (beta); RTC is enabled per request via rtc_executed_steps"
     )
 
+    parser.add_argument(
+        "--warmup_robo_name",
+        type=str,
+        default=None,
+        help="Robot config name to warm up (compile) plain and RTC inference with before serving"
+    )
+
     args = parser.parse_args()
 
     model = LingbotVLAv2Server(
@@ -669,6 +713,8 @@ def main():
         use_compile=args.use_compile,
         rtc_max_guidance=args.rtc_max_guidance,
     )
+    if args.warmup_robo_name:
+        model.warmup(args.warmup_robo_name)
     model_server = WebsocketPolicyServer(model, port=args.port)
     model_server.serve_forever()
 

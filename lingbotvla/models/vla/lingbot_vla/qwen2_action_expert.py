@@ -194,6 +194,26 @@ class Qwen2FusedExperts(nn.Module):
             fc2_weight=self.down_proj,
         )
 
+    def dense_forward(self, hidden_states, routing_weights, selected_experts):
+        """Every expert processes every token; unselected experts get zero routing weight.
+
+        Exactly matches the sparse paths and is fully traceable/differentiable by torch.compile,
+        which suits inference that needs input gradients (RTC guidance) on the action expert's
+        few tokens. Cost grows with num_tokens * num_experts, so it is not meant for training.
+        """
+        num_experts, intermediate_size, hidden_size = self.gate_proj.shape
+        num_tokens = hidden_states.shape[0]
+        gate = hidden_states @ self.gate_proj.reshape(num_experts * intermediate_size, hidden_size).t()
+        up = hidden_states @ self.up_proj.reshape(num_experts * intermediate_size, hidden_size).t()
+        dense_weights = hidden_states.new_zeros(num_tokens, num_experts).scatter(
+            1, selected_experts, routing_weights.to(hidden_states.dtype)
+        )
+        inter = (F.silu(gate) * up).view(num_tokens, num_experts, intermediate_size)
+        inter = inter * dense_weights.unsqueeze(-1)
+        # (E, T, I) @ (E, I, D) -> (E, T, D), then reduce over experts.
+        out = torch.bmm(inter.transpose(0, 1), self.down_proj.transpose(1, 2))
+        return out.sum(dim=0)
+
 
 class FixQwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -331,6 +351,12 @@ class Qwen2TokenMoeBlock(nn.Module):
                         selected_experts=selected_experts,
                         hidden_states=hidden_flat,
                     )
+            elif not self.training and torch.is_grad_enabled():
+                # Inference that backprops to the inputs (RTC guidance): the group_gemm autograd
+                # path graph-breaks torch.compile at every layer, the dense form compiles whole.
+                final_hidden_states = self.experts.dense_forward(
+                    hidden_flat, routing_weights, selected_experts
+                )
             else:
                 final_hidden_states = self.experts(
                     module=self,

@@ -988,7 +988,9 @@ class FlowMatchingV2(FlowMatchingV1):
         time = torch.tensor(1.0, dtype=dtype, device=device)
         count = 0
         predict_velocity_fn = self.predict_velocity
-        if getattr(self, "_use_compile_predict_velocity", False):
+        # Inside an outer torch.compile of sample_actions, predict_velocity is simply inlined;
+        # nesting a second compile there leaves it running eagerly when later called un-nested.
+        if getattr(self, "_use_compile_predict_velocity", False) and not torch.compiler.is_compiling():
             predict_velocity_fn = getattr(self, "_compiled_predict_velocity", None)
             if predict_velocity_fn is None:
                 predict_velocity_fn = torch.compile(
